@@ -1,0 +1,25 @@
+{
+  "name": "ecommerce-microservices",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "libs/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace=services/api-gateway\" \"npm run dev --workspace=services/auth-service\" \"npm run dev --workspace=services/product-service\"",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}
