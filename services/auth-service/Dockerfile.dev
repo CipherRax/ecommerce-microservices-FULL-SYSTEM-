@@ -1,0 +1,20 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install dependencies
+COPY package*.json ./
+RUN npm ci
+
+# Install TypeScript globally for ts-node
+RUN npm install -g ts-node
+
+# Copy source code
+COPY src ./src
+COPY tsconfig.json ./
+
+# Expose port
+EXPOSE ${PORT}
+
+# Start with nodemon for hot reload
+CMD ["npm", "run", "dev"]
