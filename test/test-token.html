@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+    <head>
+        <script type="module">
+            import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+            import {
+                getAuth,
+                signInWithEmailAndPassword,
+            } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+
+            const firebaseConfig = {
+                apiKey: "AIzaSyBcxa5w2wqiPwR1_OrBM1KKpAUhj3Ryth4",
+                authDomain: "micro-services-23b2a.firebaseapp.com",
+                projectId: "micro-services-23b2a",
+                storageBucket: "micro-services-23b2a.firebasestorage.app",
+                messagingSenderId: "72927734050",~
+                appId: "1:72927734050:web:42febca0ba5ad36be51d7b",
+                measurementId: "G-1SHFM6GFJL",
+            };
+
+            const app = initializeApp(firebaseConfig);
+            const auth = getAuth(app);
+
+            async function getToken() {
+                try {
+                    const userCredential = await signInWithEmailAndPassword(
+                        auth,
+                        "test@example.com",
+                        "password123",
+                    );
+                    const idToken = await userCredential.user.getIdToken(
+                        /* forceRefresh */ true,
+                    );
+                    console.log("ID Token:", idToken);
+                    // copy this token
+                } catch (err) {
+                    console.error(err);
+                }
+            }
+
+            getToken();
+        </script>
+    </head>
+    <body>
+        Open console to see token
+    </body>
+</html>
