@@ -1,190 +1,332 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
-import { MpesaService } from './mpesa-helper';
+import fastifyCors from '@fastify/cors';
+import fastifyHelmet from '@fastify/helmet';
+import { MpesaService } from './services/mpesa.service';
 import { verifyToken } from './middleware/auth';
+import { TransactionRepository } from './repositories/transaction.repository';
 
 const fastify = Fastify({
-    logger: true,
-    bodyLimit: 1048576 // 1MB
+    logger: {
+        level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
+        transport: process.env.NODE_ENV === 'development'
+            ? { target: 'pino-pretty' }
+            : undefined
+    },
+    bodyLimit: 1048576
 });
 
-// Request logging middleware
-fastify.addHook('preHandler', (request, reply, done) => {
-    console.log(`${request.method} ${request.url}`, request.body);
-    done();
-});
-
-// CORS setup
-fastify.register(import('@fastify/cors'), {
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+// Security middleware
+fastify.register(fastifyCors, {
+    origin: process.env.NODE_ENV === 'production'
+        ? ['https://your-frontend-domain.com']
+        : '*',
+    methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization']
 });
 
-fastify.get('/health', async () => ({
-    status: 'ok',
-    service: 'payment',
-    timestamp: new Date().toISOString()
-}));
+fastify.register(fastifyHelmet, {
+    contentSecurityPolicy: process.env.NODE_ENV === 'production'
+});
 
-// Simple token test (public)
-fastify.get('/mpesa/token-test', async () => {
+// Request logging
+fastify.addHook('preHandler', (request, reply, done) => {
+    const logData = {
+        method: request.method,
+        url: request.url,
+        ip: request.ip,
+        userAgent: request.headers['user-agent']
+    };
+
+    if (process.env.NODE_ENV === 'development') {
+        console.log('📥 Request:', logData);
+    }
+    done();
+});
+
+const mpesaService = new MpesaService();
+const transactionRepo = new TransactionRepository();
+
+// ========== HEALTH ENDPOINTS ==========
+fastify.get('/health', async () => {
+    const mpesaHealthy = await mpesaService.healthCheck();
+
+    return {
+        status: mpesaHealthy ? 'healthy' : 'degraded',
+        service: 'payment',
+        environment: process.env.NODE_ENV,
+        timestamp: new Date().toISOString(),
+        mpesa: mpesaHealthy ? 'connected' : 'disconnected'
+    };
+});
+
+fastify.get('/health/mpesa', async () => {
     try {
-        const mpesaService = new MpesaService();
-        const token = await mpesaService.getAccessToken();
-
+        const healthy = await mpesaService.healthCheck();
         return {
-            success: true,
-            token: token.substring(0, 30) + '...',
-            length: token.length,
+            healthy,
+            environment: process.env.MPESA_ENVIRONMENT,
             timestamp: new Date().toISOString()
         };
     } catch (error: any) {
         return {
-            success: false,
+            healthy: false,
             error: error.message,
-            details: error.response?.data
+            timestamp: new Date().toISOString()
         };
     }
 });
 
-// Public test endpoint (no auth required)
-fastify.post('/mpesa/test-payment', async (request, reply) => {
-    try {
+// ========== PAYMENT ENDPOINTS ==========
+fastify.post('/api/payments/mpesa/stkpush',
+    { preHandler: verifyToken },
+    async (request, reply) => {
         const body = request.body as any;
+        const user = (request as any).user;
 
-        // Validate
-        if (!body.phone || !body.amount || !body.orderId) {
-            reply.code(400);
+        try {
+            // Validate request
+            if (!body.phone || !body.amount || !body.orderId) {
+                reply.code(400);
+                return {
+                    success: false,
+                    error: 'Missing required fields: phone, amount, orderId'
+                };
+            }
+
+            // Initiate payment
+            const result = await mpesaService.initiateSTKPush({
+                phone: body.phone,
+                amount: body.amount,
+                orderId: body.orderId,
+                description: body.description,
+                accountReference: body.accountReference
+            });
+
+            // Log successful initiation
+            console.log('Payment initiated:', {
+                userId: user.uid,
+                orderId: body.orderId,
+                amount: body.amount,
+                checkoutRequestId: result.checkoutRequestId,
+                environment: process.env.MPESA_ENVIRONMENT
+            });
+
+            return {
+                success: true,
+                data: result,
+                message: 'Payment initiated successfully. Check your phone for M-Pesa prompt.'
+            };
+
+        } catch (error: any) {
+            console.error('Payment initiation failed:', {
+                userId: user?.uid,
+                orderId: body.orderId,
+                error: error.message
+            });
+
+            reply.code(error.message.includes('Invalid') ? 400 : 500);
             return {
                 success: false,
-                error: 'Missing required fields: phone, amount, orderId'
+                error: error.message,
+                code: 'PAYMENT_INITIATION_FAILED'
             };
         }
-
-        // Clean phone - use test number for sandbox
-        const phone = '254708374149'; // Always use test number for sandbox
-
-        const mpesaService = new MpesaService();
-        const result = await mpesaService.initiateSTKPush(
-            phone,
-            Number(body.amount),
-            body.orderId
-        );
-
-        return {
-            success: true,
-            data: result,
-            message: `STK Push sent to ${phone}. Check your phone.`
-        };
-    } catch (error: any) {
-        console.error('Payment error:', error);
-
-        reply.code(500);
-        return {
-            success: false,
-            error: error.message,
-            details: error.response?.data,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-        };
     }
-});
+);
 
-// Protected endpoint (with auth)
-fastify.post('/mpesa/stkpush', { preHandler: verifyToken }, async (request, reply) => {
+// ========== TRANSACTION ENDPOINTS ==========
+fastify.get('/api/payments/transactions/:orderId',
+    { preHandler: verifyToken },
+    async (request, reply) => {
+        const { orderId } = request.params as any;
+        const user = (request as any).user;
+
+        try {
+            const transactions = await transactionRepo.findByOrderId(orderId);
+
+            // Optional: Verify user owns this order
+            // const order = await orderService.getOrder(orderId);
+            // if (order.userId !== user.uid) {
+            //     reply.code(403);
+            //     return { success: false, error: 'Unauthorized' };
+            // }
+
+            return {
+                success: true,
+                data: transactions
+            };
+        } catch (error: any) {
+            console.error('Get transactions error:', error);
+            reply.code(500);
+            return {
+                success: false,
+                error: 'Failed to fetch transactions'
+            };
+        }
+    }
+);
+
+fastify.post('/api/payments/transactions/query',
+    { preHandler: verifyToken },
+    async (request, reply) => {
+        const body = request.body as { checkoutRequestId: string };
+        const user = (request as any).user;
+
+        try {
+            if (!body.checkoutRequestId) {
+                reply.code(400);
+                return { success: false, error: 'checkoutRequestId is required' };
+            }
+
+            const result = await mpesaService.queryTransaction(body.checkoutRequestId);
+
+            return {
+                success: true,
+                data: result
+            };
+        } catch (error: any) {
+            console.error('Query transaction error:', error);
+            reply.code(500);
+            return {
+                success: false,
+                error: 'Failed to query transaction status'
+            };
+        }
+    }
+);
+
+// ========== CALLBACK ENDPOINT ==========
+fastify.post('/api/payments/mpesa/callback', async (request, reply) => {
+    const callback = request.body as any;
+
     try {
-        const body = request.body as any;
-        const user = (request as any).user; // From verifyToken middleware
+        // Log callback for debugging
+        console.log('🔔 M-Pesa Callback:', {
+            timestamp: new Date().toISOString(),
+            callbackType: callback?.Body?.stkCallback ? 'STK' : 'Other',
+            data: callback
+        });
 
-        console.log('Payment request from user:', user?.uid, 'body:', body);
+        if (callback.Body?.stkCallback) {
+            const stkCallback = callback.Body.stkCallback;
+            const resultCode = stkCallback.ResultCode;
 
-        // Validate
-        if (!body.phone || !body.amount || !body.orderId) {
-            reply.code(400);
-            return {
-                success: false,
-                error: 'Missing required fields'
-            };
+            // Find transaction
+            const transaction = await transactionRepo.findByCheckoutRequestId(
+                stkCallback.CheckoutRequestID
+            );
+
+            if (transaction) {
+                // Update transaction with callback data
+                await transactionRepo.updateTransaction(
+                    stkCallback.CheckoutRequestID,
+                    {
+                        status: resultCode === '0' ? 'completed' : 'failed',
+                        resultCode: resultCode.toString(),
+                        resultDescription: stkCallback.ResultDesc,
+                        callbackData: callback
+                    }
+                );
+
+                // Extract payment details if successful
+                if (resultCode === '0' && stkCallback.CallbackMetadata?.Item) {
+                    const items = stkCallback.CallbackMetadata.Item;
+                    const updateData: any = {};
+
+                    items.forEach((item: any) => {
+                        if (item.Name === 'Amount') updateData.amount = item.Value;
+                        if (item.Name === 'MpesaReceiptNumber') updateData.mpesaReceiptNumber = item.Value;
+                        if (item.Name === 'TransactionDate') updateData.transactionDate = item.Value;
+                        if (item.Name === 'PhoneNumber') updateData.phone = item.Value;
+                    });
+
+                    await transactionRepo.updateTransaction(
+                        stkCallback.CheckoutRequestID,
+                        updateData
+                    );
+
+                    // TODO: Update order status to paid
+                    // await orderService.markAsPaid(transaction.orderId, {
+                    //     mpesaReceiptNumber: updateData.mpesaReceiptNumber,
+                    //     transactionDate: updateData.transactionDate
+                    // });
+                }
+
+                // TODO: Send webhook/notification to order service
+                // await webhookService.sendPaymentUpdate({
+                //     orderId: transaction.orderId,
+                //     status: resultCode === '0' ? 'paid' : 'failed',
+                //     checkoutRequestId: stkCallback.CheckoutRequestID,
+                //     mpesaReceiptNumber: resultCode === '0' ? updateData.mpesaReceiptNumber : null
+                // });
+            }
+
+            console.log(`Callback processed: ${stkCallback.CheckoutRequestID} - Result: ${resultCode}`);
         }
 
-        // Clean phone number
-        const phone = body.phone.toString().replace(/\D/g, '');
-        if (!phone.startsWith('254') || phone.length !== 12) {
-            reply.code(400);
-            return {
-                success: false,
-                error: 'Phone must be 12 digits starting with 254'
-            };
-        }
-
-        const mpesaService = new MpesaService();
-        const result = await mpesaService.initiateSTKPush(
-            phone,
-            Number(body.amount),
-            body.orderId
-        );
-
+        // Always return success to M-Pesa
         return {
-            success: true,
-            data: result,
-            message: 'Payment initiated successfully'
+            ResultCode: 0,
+            ResultDesc: 'Success'
         };
-    } catch (error: any) {
-        console.error('Protected payment error:', error);
 
-        const statusCode = error.response?.status || 500;
-        reply.code(statusCode);
+    } catch (error) {
+        console.error('Callback processing error:', error);
 
+        // Still return success to M-Pesa (they'll retry if needed)
         return {
-            success: false,
-            error: error.response?.data?.errorMessage || 'Payment failed',
-            details: error.response?.data || error.message
+            ResultCode: 0,
+            ResultDesc: 'Success'
         };
     }
 });
 
-// Callback endpoint
-fastify.post('/mpesa/callback', async (request, reply) => {
-    const callback = request.body;
-    console.log('MPesa Callback:', JSON.stringify(callback, null, 2));
+// ========== ERROR HANDLING ==========
+fastify.setErrorHandler((error, request, reply) => {
+    console.error('Unhandled error:', {
+        method: request.method,
+        url: request.url,
+        error: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
 
-    // Process the callback
-    // TODO: Update order status in database
+    const statusCode = error.statusCode || 500;
+    const message = statusCode === 500
+        ? 'Internal server error'
+        : error.message;
 
-    return {
-        ResultCode: 0,
-        ResultDesc: 'Success'
-    };
-});
-
-// Error handler
-fastify.setErrorHandler((error: any, request, reply) => {
-    console.error('Global error:', error);
-
-    reply.status(error.statusCode || 500).send({
+    reply.status(statusCode).send({
         success: false,
-        error: error.message || 'Internal server error'
+        error: message,
+        ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
     });
 });
 
+// ========== START SERVER ==========
 const start = async () => {
     try {
-        await fastify.listen({
-            port: 3003,
-            host: '0.0.0.0'
-        });
+        const port = parseInt(process.env.PORT || '3003');
+        const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
+
+        await fastify.listen({ port, host });
+
         console.log(`
-        🚀 Payment service running!
-        📍 Local: http://localhost:3003
-        🌐 Public: https://presutural-brecken-mandibular.ngrok-free.dev
+        🚀 Payment Service Started!
+        📍 Environment: ${process.env.NODE_ENV}
+        💰 M-Pesa Mode: ${process.env.MPESA_ENVIRONMENT}
+        🌐 Server: http://${host}:${port}
+        🕐 Time: ${new Date().toISOString()}
         
-        Available endpoints:
-        GET  /health
-        GET  /mpesa/token-test
-        POST /mpesa/test-payment (no auth)
-        POST /mpesa/stkpush (requires auth)
-        POST /mpesa/callback (for Daraja)
+        Available Endpoints:
+        GET    /health
+        GET    /health/mpesa
+        POST   /api/payments/mpesa/stkpush (protected)
+        GET    /api/payments/transactions/:orderId (protected)
+        POST   /api/payments/transactions/query (protected)
+        POST   /api/payments/mpesa/callback (public - for M-Pesa)
         `);
+
     } catch (err) {
         console.error('Failed to start server:', err);
         process.exit(1);
